@@ -1,0 +1,283 @@
+# Heart & Diabetes Prediction — End-to-End
+# Author: Kamala
+# Requires: python>=3.9, pandas, numpy, scikit-learn, joblib, matplotlib (optional)
+
+import os
+import numpy as np
+import pandas as pd
+from typing import Tuple, Dict, Any
+
+from sklearn.model_selection import train_test_split, StratifiedKFold, cross_val_score
+from sklearn.preprocessing import StandardScaler
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline
+from sklearn.metrics import (
+    accuracy_score, precision_score, recall_score, f1_score, roc_auc_score,
+    confusion_matrix, classification_report
+)
+from sklearn.linear_model import LogisticRegression
+from sklearn.ensemble import RandomForestClassifier
+from joblib import dump
+
+# Optional: plotting ROC curves (comment out if not needed)
+import matplotlib.pyplot as plt
+from sklearn.metrics import RocCurveDisplay
+
+def evaluate_model(name: str, y_true: np.ndarray, y_pred: np.ndarray, y_proba: np.ndarray) -> Dict[str, Any]:
+    """Return evaluation metrics and print a compact report."""
+    acc = accuracy_score(y_true, y_pred)
+    prec = precision_score(y_true, y_pred)
+    rec = recall_score(y_true, y_pred)
+    f1 = f1_score(y_true, y_pred)
+    auc = roc_auc_score(y_true, y_proba)
+
+    print(f"\n=== {name} Evaluation ===")
+    print(f"Accuracy:  {acc:.3f}")
+    print(f"Precision: {prec:.3f}")
+    print(f"Recall:    {rec:.3f}")
+    print(f"F1-score:  {f1:.3f}")
+    print(f"ROC-AUC:   {auc:.3f}")
+    print("Confusion Matrix:")
+    print(confusion_matrix(y_true, y_pred))
+    print("\nClassification Report:")
+    print(classification_report(y_true, y_pred))
+
+    return {"accuracy": acc, "precision": prec, "recall": rec, "f1": f1, "roc_auc": auc}
+
+
+def cross_validate_model(model: Pipeline, X: pd.DataFrame, y: pd.Series, cv_splits: int = 5) -> float:
+    """Return mean ROC-AUC from stratified CV."""
+    cv = StratifiedKFold(n_splits=cv_splits, shuffle=True, random_state=42)
+    scores = cross_val_score(model, X, y, cv=cv, scoring="roc_auc")
+    print(f"CV ROC-AUC ({cv_splits}-fold): mean={scores.mean():.3f}, std={scores.std():.3f}")
+    return scores.mean()
+
+
+def plot_roc(model: Pipeline, X_test: pd.DataFrame, y_test: pd.Series, title: str):
+    """Plot ROC curve for the given model."""
+    disp = RocCurveDisplay.from_estimator(model, X_test, y_test)
+    plt.title(title)
+    plt.grid(True)
+    plt.show()
+
+
+# ----------------------------
+# Diabetes: load, preprocess, train, evaluate
+# ----------------------------
+
+def train_diabetes(diabetes_csv_path: str = "cleaned_diabetes.csv") -> Dict[str, Any]:
+    print("\n========== Diabetes Prediction ==========")
+    df = pd.read_csv(diabetes_csv_path)
+
+    # Target and features
+    target_col = "Outcome"
+    feature_cols = [c for c in df.columns if c != target_col]
+
+    X = df[feature_cols].copy()
+    y = df[target_col].copy()
+
+    # Note: All columns are numeric already. We'll scale continuous features.
+    numeric_features = feature_cols
+
+    preprocessor = ColumnTransformer(
+        transformers=[
+            ("num", StandardScaler(), numeric_features),
+        ],
+        remainder="drop",
+    )
+
+    # Models
+    log_reg = LogisticRegression(max_iter=500, class_weight="balanced", random_state=42)
+    rf = RandomForestClassifier(
+        n_estimators=300,
+        max_depth=None,
+        min_samples_leaf=2,
+        random_state=42,
+        class_weight="balanced"
+    )
+
+    log_reg_pipe = Pipeline(steps=[("preproc", preprocessor), ("clf", log_reg)])
+    rf_pipe = Pipeline(steps=[("preproc", preprocessor), ("clf", rf)])
+
+    # Train-test split (stratified to keep class balance)
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=0.2, stratify=y, random_state=42
+    )
+
+    # Fit and evaluate Logistic Regression
+    log_reg_pipe.fit(X_train, y_train)
+    y_pred_lr = log_reg_pipe.predict(X_test)
+    y_proba_lr = log_reg_pipe.predict_proba(X_test)[:, 1]
+    metrics_lr = evaluate_model("Diabetes - LogisticRegression", y_test, y_pred_lr, y_proba_lr)
+    cv_lr = cross_validate_model(log_reg_pipe, X, y, cv_splits=5)
+
+    # Fit and evaluate Random Forest
+    rf_pipe.fit(X_train, y_train)
+    y_pred_rf = rf_pipe.predict(X_test)
+    y_proba_rf = rf_pipe.predict_proba(X_test)[:, 1]
+    metrics_rf = evaluate_model("Diabetes - RandomForest", y_test, y_pred_rf, y_proba_rf)
+    cv_rf = cross_validate_model(rf_pipe, X, y, cv_splits=5)
+
+    # Optional: ROC curve
+    # plot_roc(log_reg_pipe, X_test, y_test, "Diabetes - Logistic Regression ROC")
+    # plot_roc(rf_pipe, X_test, y_test, "Diabetes - Random Forest ROC")
+
+    # Persist best model (choose by ROC-AUC or F1)
+    best_model_name = "rf" if metrics_rf["roc_auc"] >= metrics_lr["roc_auc"] else "lr"
+    best_pipe = rf_pipe if best_model_name == "rf" else log_reg_pipe
+
+    os.makedirs("models", exist_ok=True)
+    dump(best_pipe, f"models/diabetes_{best_model_name}_pipe.joblib")
+    print(f"\nSaved best diabetes model: models/diabetes_{best_model_name}_pipe.joblib")
+
+    return {
+        "best_model_name": best_model_name,
+        "metrics_lr": metrics_lr,
+        "metrics_rf": metrics_rf,
+        "cv_lr": cv_lr,
+        "cv_rf": cv_rf,
+        "feature_cols": feature_cols,
+    }
+
+
+def predict_diabetes(sample: Dict[str, float], model_path: str) -> Tuple[int, float]:
+    """Predict outcome for a single diabetes sample dict using a saved pipeline."""
+    from joblib import load
+    pipe = load(model_path)
+    X = pd.DataFrame([sample])
+    pred = int(pipe.predict(X)[0])
+    proba = float(pipe.predict_proba(X)[0, 1])
+    return pred, proba
+
+
+# ----------------------------
+# Heart disease: load, preprocess, train, evaluate
+# ----------------------------
+
+def train_heart(heart_csv_path: str = "cleaned_heart.csv") -> Dict[str, Any]:
+    print("\n========== Heart Disease Prediction ==========")
+    df = pd.read_csv(heart_csv_path)
+
+    # Target and features
+    target_col = "target"
+    feature_cols = [c for c in df.columns if c != target_col]
+
+    X = df[feature_cols].copy()
+    y = df[target_col].copy()
+
+    # Identify numeric features (all columns are numeric in this dataset)
+    numeric_features = feature_cols
+
+    # Scale continuous features for LR; RF is robust but we can keep the same pipeline
+    preprocessor = ColumnTransformer(
+        transformers=[
+            ("num", StandardScaler(), numeric_features),
+        ],
+        remainder="drop",
+    )
+
+    # Models
+    log_reg = LogisticRegression(max_iter=500, class_weight="balanced", random_state=42)
+    rf = RandomForestClassifier(
+        n_estimators=300,
+        max_depth=None,
+        min_samples_leaf=2,
+        random_state=42,
+        class_weight="balanced"
+    )
+
+    log_reg_pipe = Pipeline(steps=[("preproc", preprocessor), ("clf", log_reg)])
+    rf_pipe = Pipeline(steps=[("preproc", preprocessor), ("clf", rf)])
+
+    # Train-test split
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=0.2, stratify=y, random_state=42
+    )
+
+    # Fit and evaluate Logistic Regression
+    log_reg_pipe.fit(X_train, y_train)
+    y_pred_lr = log_reg_pipe.predict(X_test)
+    y_proba_lr = log_reg_pipe.predict_proba(X_test)[:, 1]
+    metrics_lr = evaluate_model("Heart - LogisticRegression", y_test, y_pred_lr, y_proba_lr)
+    cv_lr = cross_validate_model(log_reg_pipe, X, y, cv_splits=5)
+
+    # Fit and evaluate Random Forest
+    rf_pipe.fit(X_train, y_train)
+    y_pred_rf = rf_pipe.predict(X_test)
+    y_proba_rf = rf_pipe.predict_proba(X_test)[:, 1]
+    metrics_rf = evaluate_model("Heart - RandomForest", y_test, y_pred_rf, y_proba_rf)
+    cv_rf = cross_validate_model(rf_pipe, X, y, cv_splits=5)
+
+    # Optional: ROC curve
+    # plot_roc(log_reg_pipe, X_test, y_test, "Heart - Logistic Regression ROC")
+    # plot_roc(rf_pipe, X_test, y_test, "Heart - Random Forest ROC")
+
+    # Persist best model
+    best_model_name = "rf" if metrics_rf["roc_auc"] >= metrics_lr["roc_auc"] else "lr"
+    best_pipe = rf_pipe if best_model_name == "rf" else log_reg_pipe
+
+    os.makedirs("models", exist_ok=True)
+    dump(best_pipe, f"models/heart_{best_model_name}_pipe.joblib")
+    print(f"\nSaved best heart model: models/heart_{best_model_name}_pipe.joblib")
+
+    # Optional: feature importance from RF (after fit)
+    if best_model_name == "rf":
+        # Extract feature importance from the inner RF using a dummy fit without scaler
+        rf_only = rf_pipe.named_steps["clf"]
+        # Note: pipeline transforms data; for true importances, refit RF on scaled data separately if needed
+        importances = rf_only.feature_importances_
+        print("\nTop 10 feature importances (RandomForest):")
+        fi = pd.Series(importances, index=numeric_features).sort_values(ascending=False)
+        print(fi.head(10))
+
+    return {
+        "best_model_name": best_model_name,
+        "metrics_lr": metrics_lr,
+        "metrics_rf": metrics_rf,
+        "cv_lr": cv_lr,
+        "cv_rf": cv_rf,
+        "feature_cols": feature_cols,
+    }
+
+
+def predict_heart(sample: Dict[str, float], model_path: str) -> Tuple[int, float]:
+    """Predict outcome for a single heart sample dict using a saved pipeline."""
+    from joblib import load
+    pipe = load(model_path)
+    X = pd.DataFrame([sample])
+    pred = int(pipe.predict(X)[0])
+    proba = float(pipe.predict_proba(X)[0, 1])
+    return pred, proba
+
+
+# ----------------------------
+# Run both trainings
+# ----------------------------
+
+if __name__ == "__main__":
+    # Adjust paths if your CSVs are in a different location
+    diabetes_results = train_diabetes("cleaned_diabetes.csv")
+    heart_results = train_heart("cleaned_heart.csv")
+
+    # Quick demo prediction using saved models (replace values with real inputs)
+    # Diabetes sample keys must match columns exactly:
+    diabetes_sample = {
+        "Pregnancies": 2,
+        "Glucose": 120,
+        "BloodPressure": 70,
+        "SkinThickness": 23,
+        "Insulin": 80.0,
+        "BMI": 32.0,
+        "DiabetesPedigreeFunction": 0.5,
+        "Age": 35
+    }
+    pred_d, proba_d = predict_diabetes(diabetes_sample, f"models/diabetes_{diabetes_results['best_model_name']}_pipe.joblib")
+    print(f"\nDiabetes prediction: class={pred_d}, probability={proba_d:.3f}")
+
+    # Heart sample keys must match columns exactly:
+    heart_sample = {
+        "age": 54, "sex": 1, "cp": 0, "trestbps": 130, "chol": 239, "fbs": 0,
+        "restecg": 1, "thalach": 126, "exang": 1, "oldpeak": 2.8, "slope": 1, "ca": 1, "thal": 3
+    }
+    pred_h, proba_h = predict_heart(heart_sample, f"models/heart_{heart_results['best_model_name']}_pipe.joblib")
+    print(f"Heart prediction: class={pred_h}, probability={proba_h:.3f}")
